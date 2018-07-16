@@ -17,15 +17,17 @@
 
 package org.apache.spark.sql.execution.datasources.jdbc
 
-import java.util.Properties
-
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.Partition
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, Row, SaveMode, SparkSession, SQLContext}
+import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SaveMode, SparkSession, SQLContext}
+import org.apache.spark.sql.catalyst.analysis._
+import org.apache.spark.sql.jdbc.JdbcDialects
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.Utils
 
 /**
  * Instructions on how to partition the table among workers.
@@ -36,7 +38,7 @@ private[sql] case class JDBCPartitioningInfo(
     upperBound: Long,
     numPartitions: Int)
 
-private[sql] object JDBCRelation {
+private[sql] object JDBCRelation extends Logging {
   /**
    * Given a partitioning schematic (a column of integral type, a number of
    * partitions, and upper and lower bounds on the column's value), generate
@@ -48,46 +50,118 @@ private[sql] object JDBCRelation {
    * Null value predicate is added to the first partition where clause to include
    * the rows with null value for the partitions column.
    *
+   * @param schema resolved schema of a JDBC table
    * @param partitioning partition information to generate the where clause for each partition
+   * @param resolver function used to determine if two identifiers are equal
+   * @param jdbcOptions JDBC options that contains url
    * @return an array of partitions with where clause for each partition
    */
-  def columnPartition(partitioning: JDBCPartitioningInfo): Array[Partition] = {
-    if (partitioning == null) return Array[Partition](JDBCPartition(null, 0))
+  def columnPartition(
+      schema: StructType,
+      partitioning: JDBCPartitioningInfo,
+      resolver: Resolver,
+      jdbcOptions: JDBCOptions): Array[Partition] = {
+    if (partitioning == null || partitioning.numPartitions <= 1 ||
+      partitioning.lowerBound == partitioning.upperBound) {
+      return Array[Partition](JDBCPartition(null, 0))
+    }
 
-    val numPartitions = partitioning.numPartitions
-    val column = partitioning.column
-    if (numPartitions == 1) return Array[Partition](JDBCPartition(null, 0))
+    val lowerBound = partitioning.lowerBound
+    val upperBound = partitioning.upperBound
+    require (lowerBound <= upperBound,
+      "Operation not allowed: the lower bound of partitioning column is larger than the upper " +
+      s"bound. Lower bound: $lowerBound; Upper bound: $upperBound")
+
+    val numPartitions =
+      if ((upperBound - lowerBound) >= partitioning.numPartitions || /* check for overflow */
+          (upperBound - lowerBound) < 0) {
+        partitioning.numPartitions
+      } else {
+        logWarning("The number of partitions is reduced because the specified number of " +
+          "partitions is less than the difference between upper bound and lower bound. " +
+          s"Updated number of partitions: ${upperBound - lowerBound}; Input number of " +
+          s"partitions: ${partitioning.numPartitions}; Lower bound: $lowerBound; " +
+          s"Upper bound: $upperBound.")
+        upperBound - lowerBound
+      }
     // Overflow and silliness can happen if you subtract then divide.
     // Here we get a little roundoff, but that's (hopefully) OK.
-    val stride: Long = (partitioning.upperBound / numPartitions
-                      - partitioning.lowerBound / numPartitions)
+    val stride: Long = upperBound / numPartitions - lowerBound / numPartitions
+
+    val column = verifyAndGetNormalizedColumnName(
+      schema, partitioning.column, resolver, jdbcOptions)
+
     var i: Int = 0
-    var currentValue: Long = partitioning.lowerBound
-    var ans = new ArrayBuffer[Partition]()
+    var currentValue: Long = lowerBound
+    val ans = new ArrayBuffer[Partition]()
     while (i < numPartitions) {
-      val lowerBound = if (i != 0) s"$column >= $currentValue" else null
+      val lBound = if (i != 0) s"$column >= $currentValue" else null
       currentValue += stride
-      val upperBound = if (i != numPartitions - 1) s"$column < $currentValue" else null
+      val uBound = if (i != numPartitions - 1) s"$column < $currentValue" else null
       val whereClause =
-        if (upperBound == null) {
-          lowerBound
-        } else if (lowerBound == null) {
-          s"$upperBound or $column is null"
+        if (uBound == null) {
+          lBound
+        } else if (lBound == null) {
+          s"$uBound or $column is null"
         } else {
-          s"$lowerBound AND $upperBound"
+          s"$lBound AND $uBound"
         }
       ans += JDBCPartition(whereClause, i)
       i = i + 1
     }
     ans.toArray
   }
+
+  // Verify column name based on the JDBC resolved schema
+  private def verifyAndGetNormalizedColumnName(
+      schema: StructType,
+      columnName: String,
+      resolver: Resolver,
+      jdbcOptions: JDBCOptions): String = {
+    val dialect = JdbcDialects.get(jdbcOptions.url)
+    schema.map(_.name).find { fieldName =>
+      resolver(fieldName, columnName) ||
+        resolver(dialect.quoteIdentifier(fieldName), columnName)
+    }.map(dialect.quoteIdentifier).getOrElse {
+      throw new AnalysisException(s"User-defined partition column $columnName not " +
+        s"found in the JDBC relation: ${schema.simpleString(Utils.maxNumToStringFields)}")
+    }
+  }
+
+  /**
+   * Takes a (schema, table) specification and returns the table's Catalyst schema.
+   * If `customSchema` defined in the JDBC options, replaces the schema's dataType with the
+   * custom schema's type.
+   *
+   * @param resolver function used to determine if two identifiers are equal
+   * @param jdbcOptions JDBC options that contains url, table and other information.
+   * @return resolved Catalyst schema of a JDBC table
+   */
+  def getSchema(resolver: Resolver, jdbcOptions: JDBCOptions): StructType = {
+    val tableSchema = JDBCRDD.resolveTable(jdbcOptions)
+    jdbcOptions.customSchema match {
+      case Some(customSchema) => JdbcUtils.getCustomSchema(
+        tableSchema, customSchema, resolver)
+      case None => tableSchema
+    }
+  }
+
+  /**
+   * Resolves a Catalyst schema of a JDBC table and returns [[JDBCRelation]] with the schema.
+   */
+  def apply(
+      parts: Array[Partition],
+      jdbcOptions: JDBCOptions)(
+      sparkSession: SparkSession): JDBCRelation = {
+    val schema = JDBCRelation.getSchema(sparkSession.sessionState.conf.resolver, jdbcOptions)
+    JDBCRelation(schema, parts, jdbcOptions)(sparkSession)
+  }
 }
 
 private[sql] case class JDBCRelation(
-    url: String,
-    table: String,
+    override val schema: StructType,
     parts: Array[Partition],
-    properties: Properties = new Properties())(@transient val sparkSession: SparkSession)
+    jdbcOptions: JDBCOptions)(@transient val sparkSession: SparkSession)
   extends BaseRelation
   with PrunedFilteredScan
   with InsertableRelation {
@@ -96,11 +170,9 @@ private[sql] case class JDBCRelation(
 
   override val needConversion: Boolean = false
 
-  override val schema: StructType = JDBCRDD.resolveTable(url, table, properties)
-
   // Check if JDBCRDD.compileFilter can accept input filters
   override def unhandledFilters(filters: Array[Filter]): Array[Filter] = {
-    filters.filter(JDBCRDD.compileFilter(_).isEmpty)
+    filters.filter(JDBCRDD.compileFilter(_, JdbcDialects.get(jdbcOptions.url)).isEmpty)
   }
 
   override def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row] = {
@@ -108,22 +180,21 @@ private[sql] case class JDBCRelation(
     JDBCRDD.scanTable(
       sparkSession.sparkContext,
       schema,
-      url,
-      properties,
-      table,
       requiredColumns,
       filters,
-      parts).asInstanceOf[RDD[Row]]
+      parts,
+      jdbcOptions).asInstanceOf[RDD[Row]]
   }
 
   override def insert(data: DataFrame, overwrite: Boolean): Unit = {
     data.write
       .mode(if (overwrite) SaveMode.Overwrite else SaveMode.Append)
-      .jdbc(url, table, properties)
+      .jdbc(jdbcOptions.url, jdbcOptions.tableOrQuery, jdbcOptions.asProperties)
   }
 
   override def toString: String = {
+    val partitioningInfo = if (parts.nonEmpty) s" [numPartitions=${parts.length}]" else ""
     // credentials should not be included in the plan output, table information is sufficient.
-    s"JDBCRelation(${table})"
+    s"JDBCRelation(${jdbcOptions.tableOrQuery})" + partitioningInfo
   }
 }
